@@ -10,18 +10,15 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchWindowException, TimeoutException
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Configure logging
 logging.basicConfig(format="[%(levelname)s] of-scraper: %(message)s", level=logging.INFO)
 logging.info("Starting...")
 
 def sanitize_filename(filename):
     """Sanitize filename by removing illegal characters, converting to lowercase, and replacing spaces with underscores."""
-    # Remove illegal characters
     sanitized = re.sub(r'[<>:"/\\|?*\n\r\t]', '', filename)
-    # Replace spaces with underscores
     sanitized = sanitized.replace(' ', '_')
-    # Convert to lowercase
     sanitized = sanitized.lower()
     return sanitized
 
@@ -40,7 +37,6 @@ def configure_webdriver():
 def download_file(url, directory, headers=None):
     """Download a file from a URL and save it to a directory."""
     session = requests.Session()
-
     try:
         response = session.get(url, headers=headers, stream=True)
         response.raise_for_status()
@@ -54,42 +50,48 @@ def download_file(url, directory, headers=None):
     except (requests.HTTPError, Exception) as e:
         logging.error(f"Failed to download {url}: {e}")
 
-def process_album(driver, album_url, headers):
-    """Process an album by extracting and downloading images and videos."""
+def process_album(driver, album_url):
+    """Process an album by extracting image and video URLs."""
     driver.execute_script(f"window.open('{album_url}', '_blank');")
-    logging.info(f"Opening album: {album_url}")
     driver.switch_to.window(driver.window_handles[-1])
     try:
-        
         title = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, "//h1"))).text
-        logging.info(f"Album title: {title}")
-        sanatized_title = sanitize_filename(title)
-        os.makedirs(sanatized_title, exist_ok=True)
-
-        # Gather image URLs
+        sanitized_title = sanitize_filename(title)
         img_elements = WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.XPATH, "//div[@class='img']")))
-        for img in img_elements:
-            data_src = img.get_attribute('data-src')
-            download_file(data_src, sanatized_title, headers)
-
-        # Gather video URLs
         video_elements = WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.XPATH, "//source[@type='video/mp4']")))
-        for video in video_elements:
-            src = video.get_attribute('src')
-            download_file(src, sanatized_title, headers)
 
+        img_urls = [img.get_attribute('data-src') for img in img_elements]
+        video_urls = [video.get_attribute('src') for video in video_elements]
+
+        return sanitized_title, img_urls, video_urls
     except TimeoutException:
         logging.warning(f"Timeout while processing album: {album_url}")
+        return None, [], []
     except Exception as e:
         logging.error(f"Error while processing album {album_url}: {e}")
+        return None, [], []
     finally:
         driver.close()
         driver.switch_to.window(driver.window_handles[0])
 
+def download_files_concurrently(urls, directory, headers=None, max_workers=5):
+    """Download files from a list of URLs concurrently using ThreadPoolExecutor."""
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for url in urls:
+            if url:
+                futures.append(executor.submit(download_file, url, directory, headers))
+
+        for future in as_completed(futures):
+            try:
+                future.result()  # This will raise an exception if the download failed
+            except Exception as e:
+                logging.error(f"An error occurred during download: {e}")
+
 try:
     driver = configure_webdriver()
     logging.info("Opened Chrome browser")
-    driver.get("https://www.erome.com/search?q=%EF%BD%8Fnlyfans")
+    driver.get("https://www.erome.com/DFinfinite")
     logging.info("Opened search page")
 
     albums = WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CLASS_NAME, "album-link")))
@@ -102,14 +104,30 @@ try:
     headers.update(get_cookie_header(cookies))
 
     album_urls = [album.get_attribute('href') for album in albums]
+
+    all_downloads = []
+    seen_urls = set()  # Initialize set to keep track of processed URLs
+
     for album_url in album_urls:
-        process_album(driver, album_url, headers)
+        title, img_urls, video_urls = process_album(driver, album_url)
+        if title:
+            sanitized_title = sanitize_filename(title)
+            for url in img_urls + video_urls:
+                if url and url not in seen_urls:  # Check if URL has already been processed and ensure it's not None
+                    seen_urls.add(url)  # Add URL to the set
+                    all_downloads.append((url, sanitized_title))
+
+    # Download all files concurrently
+    for url, directory in all_downloads:
+        os.makedirs(directory, exist_ok=True)
+        urls = [url for url, _ in all_downloads if _ == directory]
+        download_files_concurrently(urls, directory, headers)
 
 except KeyboardInterrupt:
     logging.info("Quitting on keyboard interrupt...")
 except NoSuchWindowException:
     logging.exception("Browser window closed unexpectedly")
-except Exception:
-    logging.exception("Unknown error occurred")
+except Exception as e:
+    logging.exception(f"Unknown error occurred: {e}")
 finally:
     driver.quit()
